@@ -133,6 +133,20 @@ const osThreadAttr_t transmitTask_attributes = {
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityLow,
 };
+/* Definitions for encoderDiffTask */
+osThreadId_t encoderDiffTaskHandle;
+const osThreadAttr_t encoderDiffTask_attributes = {
+  .name = "encoderDiffTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for turningTask */
+osThreadId_t turningTaskHandle;
+const osThreadAttr_t turningTask_attributes = {
+  .name = "turningTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
 /* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
@@ -162,6 +176,8 @@ void ultra_sensor(void *argument);
 void sensor_reading(void *argument);
 void ir_dist(void *argument);
 void transmit(void *argument);
+void encoder_diff(void *argument);
+void turning_task(void *argument);
 
 /* USER CODE BEGIN PFP */
 void MotorDrive_enable(void){
@@ -266,7 +282,7 @@ void Motor_reverse_both(int  pwmVal){
 /* USER CODE BEGIN 0 */
 
 
-//IR sensor
+//-------- IR sensor ----------
 float ir_dist_left = 0;
 float ir_dist_right = 0;
 float ir_dist_left_prev = 0.0f;
@@ -277,12 +293,24 @@ uint16_t ir_raw_left = 0;
 uint16_t ir_raw_right = 0;
 int ir_dist_right_int = 0;
 int ir_dist_left_int = 0;
+//----------------------------
 
-//Gyrometer
-uint16_t gyro_z_raw = 0;
-float gyro_z_dps = 0;
 
-//Ultrasonic Sensor
+//------ Gyrometer ------
+int16_t gyro_z_raw = 0;
+float gyro_z_dps = 0.0f;
+int gyro_z_dps_int = 0;
+float gyro_z_dps_prev = 0.0f;
+float angle_direction = 0.0f;
+int angle_direction_int = 0;
+float prev_angle_direction = 0.0f;
+
+float angle_direction_hpf = 0.0f;
+float angle_direction_hpf_prev = 0.0f;
+int angle_direction_hpf_int = 0;
+//-----------------------
+
+//--- Ultrasonic Sensor ---
 int us_echo = 0;
 float us_dist = 0.0f;
 int tc1 = 0;
@@ -290,32 +318,57 @@ int tc2 = 0;
 float us_dist_prev = 0.0f;
 float us_dist_lpf = 0.0f;
 int us_dist_int = 0;
+//--------------------------
 
-//Motor
+
+//------- Motor ------------
 int motor_left_encoder = 0;
 int motor_right_encoder = 0;
 int prev_left_encoder = 0;
 int prev_right_encoder = 0;
 
-int motor_left_encoder_lpf = 0;
-int motor_right_encoder_lpf = 0;
-int motor_left_encoder_lpf_prev = 0;
-int motor_right_encoder_lpf_prev = 0;
+float motor_left_encoder_lpf = 0;
+float motor_right_encoder_lpf = 0;
+float motor_left_encoder_lpf_prev = 0;
+float motor_right_encoder_lpf_prev = 0;
+
+uint32_t total_left_encoder = 0;
+uint32_t total_right_encoder = 0;
+int distance_travelled_int = 0;
+float distance_travelled = 0.0f;
+float total_revolution = 0.0f;
+int total_revolution_int = 0;
+int total_encoder = 0;
 
 float motor_left_rpm = 0.0f;
 float motor_right_rpm = 0.0f;
 int motor_left_rpm_int = 0;
 int motor_right_rpm_int = 0;
 
-//UART
-uint8_t aRxBuffer[20];
+float motor_left_rpm_lpf = 0.0f;
+float motor_right_rpm_lpf = 0.0f;
+int motor_left_rpm_lpf_int = 0;
+int motor_right_rpm_lpf_int = 0;
 
-//PID Controller
-#define OUTPUT_MIN -2500
-#define OUTPUT_MAX 2500
-#define OUTPUT_MAX_PWM 2500
-#define OUTPUT_MIN_PWM 0
-#define INTEGRAL_MAX 200
+int encoder_difference = 0;
+//--------------------------------
+
+//-------- UART ------------
+uint8_t aRxBuffer[20];
+//--------------------------
+
+//------------ PID Controller ----------
+#define OUTPUT_MIN_MOTOR -2500
+#define OUTPUT_MAX_MOTOR 2500
+#define OUTPUT_MAX_PWM_MOTOR 2500
+#define OUTPUT_MIN_PWM_MOTOR 0
+#define INTEGRAL_MAX_MOTOR 200
+
+#define OUTPUT_MIN_ANGLE -2500
+#define OUTPUT_MAX_ANGLE 2500
+#define OUTPUT_MAX_PWM_ANGLE 2500
+#define OUTPUT_MIN_PWM_ANGLE0
+#define INTEGRAL_MAX_ANGLE 200
 
 typedef struct {
 	float Kp;
@@ -327,13 +380,33 @@ typedef struct {
 	int pwm_output;
 } PID_Controller;
 
-PID_Controller pid_left;
-PID_Controller pid_right;
+void setPID(PID_Controller *pid, float Kp, float Ki, float Kd, int pwm_output){
+	pid->Kp = Kp;
+	pid->Ki = Ki;
+	pid->Kd = Kd;
+	pid->pwm_output = pwm_output;
+}
+PID_Controller pid_left, pid_right, pid_angle;
+
+//--------------------------------------
+
+//---------------- Miscellaneous --------------------
+#define SERVO_LEFT 47
+#define SERVO_MIDDLE 74
+#define SERVO_RIGHT 115
+#define LEFT 1
+#define RIGHT 0
+#define FORWARD 1
+#define REVERSE 0
 
 int error_left_encoder = 0, error_right_encoder = 0;
 float error_left_rpm = 0.0f, error_right_rpm = 0.0f;
 float deadband_left = 250.0f, deadband_right = 250.0f;
 int pwm_left = 0, pwm_right = 0;
+float error_angle = 0.0f;
+int error_angle_int = 0;
+//----------------------------------------------------
+
 /* USER CODE END 0 */
 
 /**
@@ -432,6 +505,12 @@ int main(void)
 
   /* creation of transmitTask */
   transmitTaskHandle = osThreadNew(transmit, NULL, &transmitTask_attributes);
+
+  /* creation of encoderDiffTask */
+  encoderDiffTaskHandle = osThreadNew(encoder_diff, NULL, &encoderDiffTask_attributes);
+
+  /* creation of turningTask */
+  turningTaskHandle = osThreadNew(turning_task, NULL, &turningTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -706,7 +785,7 @@ static void MX_TIM2_Init(void)
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 0;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 4294967295;
+  htim2.Init.Period = 65535;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
@@ -1264,8 +1343,8 @@ void PID_Compute(PID_Controller *pid, float error, float dt)
 {
 	// Integral term with anti-windup
 	pid->integral += error * dt;
-	if (pid->integral > INTEGRAL_MAX) pid->integral = INTEGRAL_MAX;
-	if (pid->integral < -INTEGRAL_MAX) pid->integral = -INTEGRAL_MAX;
+	if (pid->integral > INTEGRAL_MAX_MOTOR) pid->integral = INTEGRAL_MAX_MOTOR;
+	if (pid->integral < -INTEGRAL_MAX_MOTOR) pid->integral = -INTEGRAL_MAX_MOTOR;
 
 	// Derivative term
 	float derivative = (error - pid->prevError) / dt;
@@ -1276,17 +1355,236 @@ void PID_Compute(PID_Controller *pid, float error, float dt)
 				 + pid->Kd * derivative;
 
 	// Clamp to output range
-	if (output > OUTPUT_MAX) output = OUTPUT_MAX;
-	if (output < OUTPUT_MIN) output = OUTPUT_MIN;
+	if (output > OUTPUT_MAX_MOTOR) output = OUTPUT_MAX_MOTOR;
+	if (output < OUTPUT_MIN_MOTOR) output = OUTPUT_MIN_MOTOR;
 
 	pid->pid_change = output;
 	pid->prevError = error;
 	pid->pwm_output += (int)output;
-	if (pid->pwm_output > OUTPUT_MAX) pid->pwm_output = OUTPUT_MAX;
+	if (pid->pwm_output > OUTPUT_MAX_MOTOR) pid->pwm_output = OUTPUT_MAX_MOTOR;
 	if (pid->pwm_output < 0) pid->pwm_output = 0;
 
 }
 
+void PID_Angle(PID_Controller *pid, float error, float dt){
+	// Integral term with anti-windup
+	pid->integral += error * dt;
+	if (pid->integral > INTEGRAL_MAX_ANGLE) pid->integral = INTEGRAL_MAX_ANGLE;
+	if (pid->integral < -INTEGRAL_MAX_ANGLE) pid->integral = -INTEGRAL_MAX_ANGLE;
+
+	// Derivative term
+	float derivative = (error - pid->prevError) / dt;
+
+	// PID output
+	float output = pid->Kp * error
+				 + pid->Ki * pid->integral
+				 + pid->Kd * derivative;
+
+	// Clamp to output range
+	if (output > OUTPUT_MAX_ANGLE) output = OUTPUT_MAX_ANGLE;
+	if (output < OUTPUT_MIN_ANGLE) output = OUTPUT_MIN_ANGLE;
+
+	pid->pid_change = output;
+	pid->prevError = error;
+	pid->pwm_output = (int)output;
+	if (pid->pwm_output > OUTPUT_MAX_ANGLE) pid->pwm_output = OUTPUT_MAX_ANGLE;
+	if (pid->pwm_output < 0) pid->pwm_output = 0;
+}
+
+
+
+void forward(float target_rpm, float target_distance, int delay){
+	//-------------------- MOTOR START -----------------------
+	setPID(&pid_left, 1.5f, 0.0f, 0.0f, 0);
+	setPID(&pid_right, 1.5f, 0.0f, 0.0f, 0);
+	MotorDrive_enable();
+	Motor_direction_both(1);
+	//--------------------------------------------------------
+
+	distance_travelled = 0.0f;
+	total_left_encoder = 0.0f;
+
+	for (;;){
+		//--------------- PID Controller -------------------------
+		  error_left_rpm = (target_rpm) - motor_left_rpm;
+		  error_right_rpm = (target_rpm) - motor_right_rpm;
+
+		  PID_Compute(&pid_left, error_left_rpm, (float)(delay/1000.0f));
+		  PID_Compute(&pid_right, error_right_rpm, (float)(delay/1000.0f));
+
+		  __HAL_TIM_SetCompare(&htim9,TIM_CHANNEL_2,pid_left.pwm_output);  //Motor B (left)
+		  __HAL_TIM_SetCompare(&htim4,TIM_CHANNEL_4,pid_right.pwm_output); //Motor A (right)
+		//-------------------------------------------------------------
+
+		//-------------- Distance Calculation ----------------------
+		  total_revolution = total_left_encoder / 1525.0f;  //1320 OR 1405
+		  distance_travelled = total_revolution * 20.41f;  // wheel circumference = 20.736 OR 20.41,
+
+		  total_revolution_int = total_revolution;
+		  distance_travelled_int = distance_travelled;
+		//----------- End of Distance Calculation ------------------
+
+
+		//-------------------- Check distance travelled ------------------
+		  if ((distance_travelled >= target_distance) && (target_distance != 0.0f)){
+			  MotorStop_both();
+			  break;
+		  }
+		//-----------------------------------------------------------------
+
+		  osDelay(delay);
+	}
+}
+
+void reverse(float target_rpm, float target_distance, int delay){
+	//-------------------- MOTOR START -----------------------
+	setPID(&pid_left, 1.5f, 0.0f, 0.0f, 0);
+	setPID(&pid_right, 1.5f, 0.0f, 0.0f, 0);
+	MotorDrive_enable();
+	Motor_direction_both(0);
+	//--------------------------------------------------------
+
+	distance_travelled = 0.0f;
+	total_left_encoder = 0;
+
+	for (;;){
+		//--------------- PID Controller -------------------------
+		  error_left_rpm = (target_rpm) - motor_left_rpm;
+		  error_right_rpm = (target_rpm) - motor_right_rpm;
+
+		  PID_Compute(&pid_left, error_left_rpm, (float)(delay/1000.0f));
+		  PID_Compute(&pid_right, error_right_rpm, (float)(delay/1000.0f));
+
+		  __HAL_TIM_SetCompare(&htim9,TIM_CHANNEL_1,pid_left.pwm_output);  //Motor B (left)
+		  __HAL_TIM_SetCompare(&htim4,TIM_CHANNEL_3,pid_right.pwm_output); //Motor A (right)
+		//-------------------------------------------------------------
+
+		//-------------- Distance Calculation ----------------------
+		  total_revolution = total_left_encoder / 1525.0f;  //1320 OR 1405
+		  distance_travelled = total_revolution * 20.41f;  // wheel circumference = 20.736 OR 20.41,
+
+		  total_revolution_int = total_revolution;
+		  distance_travelled_int = distance_travelled;
+		//----------- End of Distance Calculation ------------------
+
+
+		//-------------------- Check distance travelled ------------------
+		  if ((distance_travelled >= target_distance) && (target_distance != 0.0f)){
+			  MotorStop_both();
+			  break;
+		  }
+		//-----------------------------------------------------------------
+
+		  osDelay(delay);
+	}
+}
+
+void forwardTurn(int dir, float target_angle, float target_rpm, int delay){
+	//-------------------- Servo Init -----------------------
+	HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_1);
+	if (dir == LEFT) htim12.Instance->CCR1 = SERVO_LEFT;
+	else 		  htim12.Instance->CCR1 = SERVO_RIGHT;
+	//--------------------------------------------------------
+
+	//-------------------- MOTOR START -----------------------
+	setPID(&pid_left, 1.5f, 0.0f, 0.0f, 0);
+	setPID(&pid_right, 1.5f, 0.0f, 0.0f, 0);
+	MotorDrive_enable();
+	Motor_direction_both(1);
+	//--------------------------------------------------------
+
+	osDelay(500);
+	prev_angle_direction = 0.0f;
+	angle_direction = 0.0f;
+
+
+	for (;;){
+		//------------- Turning motion -------------------------
+		  error_angle = target_angle - fabsf(angle_direction);
+		  error_angle_int = error_angle;
+		//------------------------------------------------------
+
+		//--------------- PID Controller -------------------------
+		  error_left_rpm = (target_rpm) - motor_left_rpm;
+		  error_right_rpm = (target_rpm) - motor_right_rpm;
+
+		  PID_Compute(&pid_left, error_left_rpm, (float)(delay/1000.0f));
+		  PID_Compute(&pid_right, error_right_rpm, (float)(delay/1000.0f));
+
+		  __HAL_TIM_SetCompare(&htim9,TIM_CHANNEL_2,pid_left.pwm_output);  //Motor B (left)
+		  __HAL_TIM_SetCompare(&htim4,TIM_CHANNEL_4,pid_right.pwm_output); //Motor A (right)
+		//-------------------------------------------------------------
+
+		//------------------ Check angle turned --------------------------
+//		  if (error_angle <= 15.0f){
+//			  target_rpm = 30.0f;
+//		  }
+
+		  if ((error_angle) <= 0.2f){
+			  MotorStop_both();
+			  osDelay(500);
+			  htim12.Instance->CCR1 = SERVO_MIDDLE;
+			  break;
+		  }
+		//----------------------------------------------------------------
+
+		  osDelay(delay);
+	}
+
+}
+
+void reverseTurn(int dir, float target_angle, float target_rpm, int delay){
+	//-------------------- Servo Init -----------------------
+	HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_1);
+	if (dir == LEFT) htim12.Instance->CCR1 = SERVO_LEFT;
+	else 		  htim12.Instance->CCR1 = SERVO_RIGHT;
+	//--------------------------------------------------------
+
+	//-------------------- MOTOR START -----------------------
+	setPID(&pid_left, 1.5f, 0.0f, 0.0f, 0);
+	setPID(&pid_right, 1.5f, 0.0f, 0.0f, 0);
+	MotorDrive_enable();
+	Motor_direction_both(0);
+	//--------------------------------------------------------
+
+	osDelay(500);
+	prev_angle_direction = 0.0f;
+	angle_direction = 0.0f;
+
+	for (;;){
+		//------------- Turning motion -------------------------
+		  error_angle = target_angle - fabsf(angle_direction);
+		  error_angle_int = error_angle;
+		//------------------------------------------------------
+
+		//--------------- PID Controller -------------------------
+		  error_left_rpm = (target_rpm) - motor_left_rpm;
+		  error_right_rpm = (target_rpm) - motor_right_rpm;
+
+		  PID_Compute(&pid_left, error_left_rpm, (float)(delay/1000.0f));
+		  PID_Compute(&pid_right, error_right_rpm, (float)(delay/1000.0f));
+
+		  __HAL_TIM_SetCompare(&htim9,TIM_CHANNEL_1,pid_left.pwm_output);  //Motor B (left)
+		  __HAL_TIM_SetCompare(&htim4,TIM_CHANNEL_3,pid_right.pwm_output); //Motor A (right)
+		//-------------------------------------------------------------
+
+		//------------------ Check angle turned --------------------------
+//		  if (error_angle <= 15.0f){
+//			  target_rpm = 30.0f;
+//		  }
+
+		  if ((error_angle) <= 0.2f){
+			  MotorStop_both();
+			  osDelay(500);
+			  htim12.Instance->CCR1 = SERVO_MIDDLE;
+			  break;
+		  }
+		//----------------------------------------------------------------
+
+		  osDelay(delay);
+	}
+
+}
 
 /* USER CODE END 4 */
 
@@ -1305,10 +1603,11 @@ void StartDefaultTask(void *argument)
   for(;;)
   {
 
+	// Toggle LED every 1s to show that STM not stuck in loop and still running
 	HAL_GPIO_TogglePin(LED3_GPIO_Port, LED3_Pin);
 	osDelay(1000);
 
-
+	// Buzzer turns on/off when USER button pressed
 	if (HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_0) == RESET){
 		HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_8);
 
@@ -1327,26 +1626,39 @@ void StartDefaultTask(void *argument)
 void show(void *argument)
 {
   /* USER CODE BEGIN show */
-	uint8_t message[20];
-//	char buffer[20];
-//	uint8_t counter = 0;
-//	int a;
+	char buffer[20];
+
   /* Infinite loop */
   for(;;)
   {
-//	  a = (HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_0) == RESET);
-//	  OLED_ShowString(5, 5, buffer);
-//	sprintf(buffer, "%d", counter);
-//	OLED_ShowString(5, 5, message);
-//	OLED_ShowString(5, 15, buffer);
+	  sprintf(buffer, "Motor L:%2d R:%2d", motor_left_rpm_int, motor_right_rpm_int);
+	  OLED_ShowString(5, 5, buffer);
+
+	  sprintf(buffer, "Dist:%4d", distance_travelled_int);
+	  OLED_ShowString(5, 15, buffer);
+
+	  sprintf(buffer, "IR L:%2d R:%2d", ir_dist_left_int, ir_dist_right_int);
+	  OLED_ShowString(5, 25, buffer);
+
+	  sprintf(buffer, "US:%3d", us_dist_int);
+	  OLED_ShowString(5, 35, buffer);
+
+//	  sprintf(buffer, "Angle:%3d", gyro_z_dps_int);
+	  sprintf(buffer, "%04d-\0", encoder_difference);
+	  OLED_ShowString(5, 45, buffer);
 
 	// ------- Print UART message ----------
-//	sprintf(message, "%s\0", aRxBuffer);
-//	OLED_ShowString(5, 25, message);
+//	sprintf(buffer, "%s\0", aRxBuffer);
+//	OLED_ShowString(5, 45, buffer);
 	// ----- End Print UART message --------
 
+
+
+
+	// Refreshes the OLED screen every 0.5s
+	// This is the only refresh function call in all the tasks
 	OLED_Refresh_Gram();
-//	counter++;
+
     osDelay(500);
   }
   /* USER CODE END show */
@@ -1362,51 +1674,154 @@ void show(void *argument)
 void motors(void *argument)
 {
   /* USER CODE BEGIN motors */
+//	pid_left.Kp = 2.0f;
+//	pid_left.Ki = 0.0f;
+//	pid_left.Kd = 0.0f;
+//	pid_left.pwm_output = 0;
+//
+//	pid_right.Kp = 2.0f;
+//	pid_right.Ki = 0.0f;
+//	pid_right.Kd = 0.0f;
+//	pid_right.pwm_output = 0;
 
-//	int target_encoder = 1600;
-	pid_left.Kp = 1.0f;
-	pid_left.Ki = 0.0f;
-	pid_left.Kd = 0.0f;
-	pid_left.pwm_output = 0;
 
-	pid_right.Kp = 1.0f;
-	pid_right.Ki = 0.0f;
-	pid_right.Kd = 0.0f;
-	pid_right.pwm_output = 0;
+//	int delay = 40;
+//
+//	float target_rpm_left = 60.1f;
+//	float target_rpm_right = 60.0f;
+//	float target_rpm = 60.0f;
+//	float dt = delay/1000.0f;
+//
+//	int flag = 0;
+//	int left_flag = 0;
+//	int right_flag = 0;
 
-	int delay = 50;
 
-	float target_rpm = 60.0f;
-	float dt = delay/1000.0f;
+	//90 -> 79.25
+	//180 -> 158.5
+	//270 -> 237.75
+	//360 -> 317
+//	float target_angle = 317.0f;
 
-	MotorDrive_enable();
-	osDelay(5000);
+//	__HAL_TIM_SET_COUNTER(&htim2, 0);
+//	__HAL_TIM_SET_COUNTER(&htim3, 0);
+
+	//*************** MOTOR START *****************
+//	setPID(&pid_left, 1.5f, 0.0f, 0.0f, 0);
+//	setPID(&pid_right, 1.5f, 0.0f, 0.0f, 0);
+//	MotorDrive_enable();
+//	__HAL_TIM_SetCompare(&htim9,TIM_CHANNEL_1,0);  //Motor B (left)
+//	__HAL_TIM_SetCompare(&htim4,TIM_CHANNEL_3,0);  //Motor A (right)
+	//*********************************************
+
+	//-------------------------- Servo Init -----------------------------
+//	HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_1);
+//	htim12.Instance->CCR1 = SERVO_MIDDLE; //middle
+	//--------------------------------------------------------------------
+
+
+	osDelay(5000);  //starting buffer
+	forward(60.0f, 100.0f, 40);
+	osDelay(1000);
+	forward(60.0f, 100.0f, 40);
+	osDelay(1000);
+	reverse(60.0f, 100.0f, 40);
+//	forwardTurn(RIGHT, 90.0f, 60.0f, 40);
+//	osDelay(2000);
+//	reverseTurn(LEFT, 90.0f, 60.0f, 40);
+
+	//-------------- Servo Init 2 ------------------
+//	htim12.Instance->CCR1 = SERVO_LEFT; //left
+//	osDelay(1000);
+	//----------------------------------------------
+
+//	angle_direction = 0.0f;
+
   /* Infinite loop */
   for(;;)
   {
+	  //***** Un-comment to stop *****
+	  osDelay(1000);
+	  continue;
+	  //*****************************
+
+//	  if (flag) continue;
+
+	//------------- Turning motion -------------------------
+//	  error_angle = target_angle - angle_direction;
+//	  error_angle_int = error_angle;
+	//------------------------------------------------------
+
     //--------------- PID Controller -------------------------
-	  error_left_rpm = target_rpm - motor_left_rpm;
-	  error_right_rpm = target_rpm - motor_right_rpm;
+//	  forward(&pid_left, &pid_right, target_rpm_left, target_rpm_right, dt);
+//	  error_left_rpm = (target_rpm_left) - motor_left_rpm;
+//	  error_right_rpm = (target_rpm_right) - motor_right_rpm;
+//
+//	  PID_Compute(&pid_left, error_left_rpm, dt);
+//	  PID_Compute(&pid_right, error_right_rpm, dt);
+//
+//	  __HAL_TIM_SetCompare(&htim9,TIM_CHANNEL_2,pid_left.pwm_output);  //Motor B (left)
+//	  __HAL_TIM_SetCompare(&htim4,TIM_CHANNEL_4,pid_right.pwm_output); //Motor A (right)
+	//-------------------------------------------------------------
 
-	  PID_Compute(&pid_left, error_left_rpm, dt);
-	  PID_Compute(&pid_right, error_right_rpm, dt);
+	  //---------------------- Drift Correction ---------------------------------
+//	  if (right_flag){
+//		  right_flag++;
+//		  if (right_flag >= 25){
+//			  target_rpm_right = target_rpm;
+//			  right_flag = 0;
+//		  }
+//	  }
+//
+//	  if (left_flag){
+//		  left_flag++;
+//		  if (left_flag >= 25){
+//			  target_rpm_left = target_rpm;
+//			  left_flag = 0;
+//		  }
+//	  }
+//
+//	  if (encoder_difference > 50 && !right_flag){
+//		  target_rpm_right += 1.0f;
+//		  right_flag = 1;
+//	  }
+//
+//	  else if (encoder_difference < -50 && !left_flag){
+//		  target_rpm_left += 1.0f;
+//		  left_flag = 1;
+//	  }
+	  //------------------------------------------------------------------------------
 
-	  __HAL_TIM_SetCompare(&htim9,TIM_CHANNEL_1,0);  //Motor B (left)
-	  __HAL_TIM_SetCompare(&htim4,TIM_CHANNEL_3,0);  //Motor A (right)
-	  __HAL_TIM_SetCompare(&htim9,TIM_CHANNEL_2,pid_left.pwm_output);  //Motor B (left)
-	  __HAL_TIM_SetCompare(&htim4,TIM_CHANNEL_4,pid_right.pwm_output); //Motor A (right)
-
-	//-------------- End of PID Controller ---------------------
 
 
-	  //right
-//	  Motor_forwardA(1400);//1000-1200, 1200-1475, 1400-
-	  //left
-//	  Motor_forwardB(1400);//1000-1220, 1200-1498, 1400-
-//	Motor_forward_both(1500);
+	//-------------- Distance Calculation ----------------------
+//	  total_revolution = total_left_encoder / 1525.0f;  //1320 OR 1405
+//	  distance_travelled = total_revolution * 20.41f;  // wheel circumference = 20.736 OR 20.41,
+//
+//	  total_revolution_int = total_revolution;
+//	  distance_travelled_int = distance_travelled;
+	//----------- End of Distance Calculation ------------------
 
 
-	osDelay(delay);
+	//-------------------- Check distance travelled ------------------
+//	  if ((distance_travelled >= 80.0f)){
+//		  MotorStop_both();
+//		  flag = 1;
+//		  osDelay(500);
+//		  htim12.Instance->CCR1 = SERVO_MIDDLE;
+//	  }
+	//-----------------------------------------------------------------
+
+	//------------------ Check angle turned --------------------------
+//	  if ((error_angle) <= 0.2f){
+//		  MotorStop_both();
+//		  flag = 1;
+//		  osDelay(500);
+//		  htim12.Instance->CCR1 = SERVO_MIDDLE;
+//	  }
+	//----------------------------------------------------------------
+
+//	osDelay(delay);
   }
   /* USER CODE END motors */
 }
@@ -1434,11 +1849,11 @@ void encoder(void *argument)
   uint8_t display1[20];
   uint8_t display2[20];
   uint16_t dirA;
-  float a = 0.9f;
+  float a = 0.95f;
 
   for(;;)
   {
-    if (HAL_GetTick() - tickA > 10L){
+    if (HAL_GetTick() - tickA > 40L){
     	cnt2A = __HAL_TIM_GET_COUNTER(&htim2);
     	if (__HAL_TIM_IS_TIM_COUNTING_DOWN(&htim2)){
     		if (cnt2A < cnt1A)
@@ -1453,36 +1868,47 @@ void encoder(void *argument)
     			motor_right_encoder = (65535 - cnt1A) + cnt2A;
     	}
 
-    	motor_right_encoder *= 100;
+    	//----------------------- without LPF -----------------------
+//    	if (motor_right_encoder > 250) motor_right_encoder = 0;
+//    	total_right_encoder += motor_right_encoder;
+//		motor_right_encoder *= 20;
+//		motor_right_rpm = motor_right_encoder / 22.0f; // 60/1320 = 1/22
+    	//-----------------------------------------------------------
 
-    	//no LPF
-    	if (motor_right_encoder > 5000) motor_right_encoder = 0;
+    	//------------------------------- with LPF ---------------------------------------
+    	if (motor_right_encoder > 250){
+    		motor_right_encoder = 0;
+    		motor_right_encoder_lpf = 0;
+    	}
+    	total_right_encoder += motor_right_encoder;
+    	motor_right_encoder *= 25;
+//    	total_right_encoder = __HAL_TIM_GET_COUNTER(&htim2);
     	motor_right_rpm = motor_right_encoder / 22.0f; // 60/1320 = 1/22
 
-    	//with LPF
-//    	motor_right_encoder_lpf = (motor_right_encoder * (1-a)) + (prev_right_encoder * a);
-//    	if (motor_right_encoder > 5000){
-//    		motor_right_encoder = 0;
-//    		motor_right_encoder_lpf = 0;
-//    	}
-//    	prev_right_encoder = motor_right_encoder_lpf;  // for LPF
-//    	motor_right_rpm = motor_right_encoder_lpf / 22.0f; // 60/1320 = 1/22
+    	motor_right_encoder_lpf = (motor_right_encoder * (1-a)) + (prev_right_encoder * a);
+    	prev_right_encoder = motor_right_encoder_lpf;  // for LPF
+    	motor_right_rpm_lpf = motor_right_encoder_lpf / 22.0f; // 60/1320 = 1/22
+    	motor_right_rpm_lpf_int = motor_right_rpm_lpf;
+    	//---------------------------------------------------------------------------------
 
-    	motor_right_rpm_int = (int)motor_right_rpm;
+
+    	motor_right_rpm_int = motor_right_rpm;
     	dirA = __HAL_TIM_IS_TIM_COUNTING_DOWN(&htim2);
 
+    	//-------------------- OLED Display --------------------------
 //    	sprintf(display1, "(R)S:%3d.%2d",motor_right_rpm_int, motor_right_rpm_frac);
-    	sprintf(display2, " %1d",dirA);
+//    	sprintf(display2, " %1d",dirA);
 
 //    	OLED_ShowString(5, 25, display1);
-    	OLED_ShowString(90, 25, display2);
+//    	OLED_ShowString(90, 25, display2);
+    	//-------------------------------------------------------------
 
-    	//reset procedure
+    	//---------- Reset Procedure ------------
     	cnt1A = __HAL_TIM_GET_COUNTER(&htim2);
 	    tickA = HAL_GetTick();
-
+	    //---------------------------------------
     }
-    osDelay(1);
+//    osDelay(1);
   }
   /* USER CODE END encoder */
 }
@@ -1498,10 +1924,17 @@ void servo(void *argument)
 {
   /* USER CODE BEGIN servo */
 	HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_1);
+
+//	osDelay(1500);
+//    htim12.Instance->CCR1 = SERVO_MIDDLE; //middle
+//    osDelay(1500);
+//	htim12.Instance->CCR1 = SERVO_LEFT; //middle
+//    htim12.Instance->CCR1 = SERVO_RIGHT; //right
+
   /* Infinite loop */
   for(;;)
   {
-    htim12.Instance->CCR1 = 75; //middle
+//    htim12.Instance->CCR1 = 74; //middle
 //    osDelay(1500);
 //    htim12.Instance->CCR1 = 115; //right
 //	osDelay(1500);
@@ -1537,13 +1970,13 @@ void encoder_B(void *argument)
 	uint8_t display1[20];
 	uint8_t display2[20];
 	uint16_t dirA;
-	float a = 0.9f;
+	float a = 0.95f;
 
 	char sbuf[64];
 
 	for(;;)
 	{
-	if (HAL_GetTick() - tickA > 10L){
+	if (HAL_GetTick() - tickA > 40L){
 		cnt2A = __HAL_TIM_GET_COUNTER(&htim3);
 		if (__HAL_TIM_IS_TIM_COUNTING_DOWN(&htim3)){
 			if (cnt2A < cnt1A)
@@ -1557,38 +1990,52 @@ void encoder_B(void *argument)
 			else
 				motor_left_encoder = (65535 - cnt1A) + cnt2A;
 		}
-		motor_left_encoder *= 100;
 
-		//no LPf
-		if (motor_left_encoder > 5000) motor_left_encoder = 0;
+
+		//------------------- without LPF -------------------------
+//		if (motor_left_encoder > 250) motor_left_encoder = 0;
+//		total_left_encoder += motor_left_encoder;
+//		motor_left_encoder *= 20;
+//		motor_left_rpm = motor_left_encoder / 22.0f;  //  60/1320 = 1/22
+		//---------------------------------------------------------
+
+		//---------------------- with LPF --------------------------
+		if (motor_left_encoder > 250){
+			motor_left_encoder = 0;
+			motor_left_encoder_lpf = 0;
+		}
+		total_left_encoder += motor_left_encoder;
+		motor_left_encoder *= 25;
+//		total_left_encoder = __HAL_TIM_GET_COUNTER(&htim3);
 		motor_left_rpm = motor_left_encoder / 22.0f;  //  60/1320 = 1/22
 
-		//with LPF
-//		motor_left_encoder_lpf = (motor_left_encoder * (1-a)) + (prev_left_encoder * a);  //for LPF
-//		if (motor_left_encoder > 5000){
-//			motor_left_encoder = 0;
-//			motor_left_encoder_lpf = 0;
-//		}
-//		prev_left_encoder = motor_left_encoder_lpf;  //for LPF
-//		motor_left_rpm = motor_left_encoder_lpf / 22.0f;  //  60/1320 = 1/22
+		motor_left_encoder_lpf = (motor_left_encoder * (1-a)) + (prev_left_encoder * a);  //for LPF
+		prev_left_encoder = motor_left_encoder_lpf;  //for LPF
+		motor_left_rpm_lpf = motor_left_encoder_lpf / 22.0f;  //  60/1320 = 1/22
+		motor_left_rpm_lpf_int = motor_left_rpm_lpf;
+		//-----------------------------------------------------------
 
-		motor_left_rpm_int = (int)motor_left_rpm;
+
+		motor_left_rpm_int = motor_left_rpm;
 		dirA = __HAL_TIM_IS_TIM_COUNTING_DOWN(&htim3);
 		dirA = !(dirA);
 
+		//------------------- OLED Display ----------------
 //		sprintf(display1, "(L)S:%3d.%2d",motor_left_rpm_int, motor_left_rpm_frac);
-		sprintf(display2, " %1d",dirA);
+//		sprintf(display2, " %1d",dirA);
 
 //		OLED_ShowString(5, 35, display1);
-		OLED_ShowString(90, 35, display2);
+//		OLED_ShowString(90, 35, display2);
+		//-------------------------------------------------
 
 
-		//reset procedure
+		//------------ Reset Procedure -------------
 		cnt1A = __HAL_TIM_GET_COUNTER(&htim3);
 		tickA = HAL_GetTick();
+		//------------------------------------------
 
 		}
-	osDelay(1);
+//	osDelay(1);
 	}
   /* USER CODE END encoder_B */
 }
@@ -1634,8 +2081,8 @@ void ultra_sensor(void *argument)
 
 
 
-	  sprintf(buf, "Dis:%3dcm", us_dist_int);
-	  OLED_ShowString(10,48, buf);
+//	  sprintf(buf, "Dis:%3dcm", us_dist_int);
+//	  OLED_ShowString(10,48, buf);
 
   }
   /* USER CODE END ultra_sensor */
@@ -1653,16 +2100,41 @@ void sensor_reading(void *argument)
   /* USER CODE BEGIN sensor_reading */
 	uint8_t reg_addr = 0x37;    // start from GYRO_ZOUT_H
 	uint8_t rawData[2];         // to store MSB and LSB
-	char buf[20];
-	int a;
+	float B = 0.9f;
+	uint32_t tick1, tick2;
+
+	int16_t drift_raw, drift_total=0;
+	float drift_degrees;
+
+	int delay = 10;
+	float dt = delay/1000.0f;
+	double offset = 0;
+	double trash = 0;
+	int i = 0;
 
 	icm20948_init();
-	osDelay(1000); //delay to make sure ICM 20948 power up
+	osDelay(100); //delay to make sure ICM 20948 power up
 
+//	tick1 = HAL_GetTick();
+//
+//	while (i < 1000){
+//		osDelay(1);
+//		HAL_I2C_Master_Transmit(&hi2c2, 0x68 << 1, &reg_addr, 1, 1000);
+//		HAL_I2C_Master_Receive(&hi2c2, 0x68 << 1, rawData, 2, 1000);
+//		drift_raw = (int16_t)((rawData[0] << 8) | rawData[1]);
+//		trash += (double) ((double)drift_raw) * ((HAL_GetTick() - tick1)/16400.0f);
+//		offset += drift_raw;
+//		tick1 = HAL_GetTick();
+//		i++;
+//	}
+//	offset = offset/i;
+//
+//
+//	tick1 = HAL_GetTick();
   /* Infinite loop */
   for(;;)
   {
-	// -------------- Gyroscope Readings ---------------------------------------
+	//------------------- Gyroscope Readings ---------------------------------------
 	// Step 1: Tell sensor which register to read
 	if(HAL_I2C_Master_Transmit(&hi2c2, 0x68 << 1, &reg_addr, 1, 1000)!= HAL_OK){
 		OLED_ShowString(5, 5, "0");
@@ -1674,17 +2146,29 @@ void sensor_reading(void *argument)
 	}
 	// Combine into signed 16-bit value
 	gyro_z_raw = (int16_t)((rawData[0] << 8) | rawData[1]);
+//	angle_direction += (double) ((double)gyro_z_raw - offset) * ((HAL_GetTick() - tick1)/16400.0f);
+//	angle_direction_int = angle_direction;
+//	tick1 = HAL_GetTick();
+//	if (gyro_z_raw < 150 && gyro_z_raw > 0) gyro_z_raw = 0;
 	gyro_z_dps = gyro_z_raw / 131.0f;
+	gyro_z_dps_int = gyro_z_dps;
+	// -----------------------------------------------------------------------------
 
-	//format for OLED display
-	a = gyro_z_dps;
-	sprintf(buf, "%3d", a);
-	OLED_ShowString(5, 15, buf);
-	// ------------------ End of Gyrscope Readings -------------------------------
 
-	sprintf(buf, "%3d", a);
-	OLED_ShowString(5, 15, buf);
-	osDelay(100);
+	//-------------------- Angle Calculation -----------------------
+	angle_direction = prev_angle_direction + (gyro_z_dps * dt);
+	prev_angle_direction = angle_direction;
+	angle_direction_int = angle_direction;
+	//--------------------------------------------------------------
+
+	//------------------- High-Pass Filter -------------------------
+//	angle_direction_hpf = (B * angle_direction_hpf_prev) + (B * (gyro_z_dps - gyro_z_dps_prev));
+//	angle_direction_hpf_prev = angle_direction_hpf;
+//	angle_direction_hpf_int = angle_direction_hpf;
+	//--------------------------------------------------------------
+
+
+	osDelay(delay);
   }
   /* USER CODE END sensor_reading */
 }
@@ -1699,11 +2183,11 @@ void sensor_reading(void *argument)
 void ir_dist(void *argument)
 {
   /* USER CODE BEGIN ir_dist */
-  char buf[20];
+
   /* Infinite loop */
   for(;;)
   {
-	// ---------------- IR Sensor 1 Readings (Right) ------------------------
+	// ---------------- IR Sensor Left Readings ------------------------
 	HAL_ADC_Start(&hadc1);
 	HAL_ADC_PollForConversion(&hadc1, 20);
 	ir_raw_left = HAL_ADC_GetValue(&hadc1);
@@ -1720,14 +2204,9 @@ void ir_dist(void *argument)
 //	ir_dist_left_prev = ir_dist_left_lpf;
 //	ir_dist_left_int = ir_dist_left_lpf;
 
-	//format for OLED display
+	// -------------------------------------------------------------------
 
-
-	sprintf(buf, "%2d", ir_dist_left_int);
-	OLED_ShowString(60, 5, buf);
-	// -------------- End of IR Sensor 1 Readings ----------------------
-
-	// ------------------ IR Sensor 2 Readings (Left) -----------------------
+	// ------------------ IR Sensor Right Readings  -----------------------
 	HAL_ADC_Start(&hadc2);
 	HAL_ADC_PollForConversion(&hadc2, 20);
 	ir_raw_right = HAL_ADC_GetValue(&hadc2);
@@ -1744,12 +2223,7 @@ void ir_dist(void *argument)
 //	ir_dist_right_lpf = (ir_dist_right * 0.3f) + (ir_dist_right_prev * 0.7f);
 //	ir_dist_right_prev = ir_dist_right_lpf;
 //	ir_dist_right_int = ir_dist_right_lpf;
-
-	//format for OLED display
-
-	sprintf(buf, "%2d", ir_dist_right_int);
-	OLED_ShowString(50, 15, buf);
-	// -------------- End of IR Sensor 2 Readings -----------------------------
+	// --------------------------------------------------------------------
 
     osDelay(200);
   }
@@ -1768,24 +2242,35 @@ void transmit(void *argument)
   /* USER CODE BEGIN transmit */
 //  uint8_t ch = 'A';
   char sbuf[64];
-  int target = 330*4;
   int target_rpm = 60;
 
   /* Infinite loop */
   for(;;)
   {
-//	  sprintf(sbuf, "%4d,%4d,", motor_left_encoder, motor_left_encoder_lpf);
 
-//
-//	  sprintf(sbuf, "%4d,%4d,%4d\r\n", motor_right_encoder, motor_right_encoder_lpf, target);
+	  //--------------------------------------------- Motor ------------------------------------------
+//	  sprintf(sbuf, "%2d,%2d,%3d,%3d,%2d,%7d,0\r\n", motor_left_rpm_int, motor_right_rpm_int,
+//			  	  	  	  	  	  	  	  	  motor_left_rpm_lpf_int, motor_right_rpm_lpf_int, target_rpm,
+//											  encoder_difference);
 
+	  sprintf(sbuf, "%5d,100\r\n", distance_travelled_int);
 
-	  //use RPM
-	  sprintf(sbuf, "%2d,%2d,%2d\r\n", motor_left_rpm_int, motor_right_rpm_int, target_rpm);
+//	  sprintf(sbuf, "%2d,%2d,%3d,%3d,%2d,%4d,%4d,0\r\n", motor_left_rpm_int, motor_right_rpm_int,
+//			  	  	  	  	  	  	  	  	  (int)error_left_rpm, (int)error_right_rpm, target_rpm,
+//	  	  	  	  	  	  	  	  	  	  	  pid_left.pwm_output, pid_right.pwm_output);
+	  //-----------------------------------------------------------------------------------------------
 
+	  //------------------------------- Turning Motion ----------------------------------------------
+//	  sprintf(sbuf, "%2d,%3d\r\n", error_angle, angle_direction_hpf_int);
+	  //---------------------------------------------------------------------------------------------
 
-
+	  //----------------------------- IR Distance --------------------------------------
 //	  sprintf(sbuf, "%5d,%5d,%3d\r\n", ir_dist_left_int, ir_dist_right_int, us_dist_int);
+	  //--------------------------------------------------------------------------------
+
+	  //------------------------------ Gyroscope readings -------------------------------------
+//	  sprintf(sbuf, "%5d,%3d,%3d,%3d,90\r\n", gyro_z_raw, gyro_z_dps_int, angle_direction_int, error_angle_int);
+	  //---------------------------------------------------------------------------------------
 
 	  HAL_UART_Transmit(&huart3, sbuf, strlen(sbuf), 0xFFFF);
 
@@ -1793,9 +2278,109 @@ void transmit(void *argument)
 //	if (ch < 'Z') ch++;
 //	else ch = 'A';
 
-    osDelay(50);
+    osDelay(40);
   }
   /* USER CODE END transmit */
+}
+
+/* USER CODE BEGIN Header_encoder_diff */
+/**
+* @brief Function implementing the encoderDiffTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_encoder_diff */
+void encoder_diff(void *argument)
+{
+  /* USER CODE BEGIN encoder_diff */
+	int left, right;
+  /* Infinite loop */
+  for(;;)
+  {
+    left = 65535 - __HAL_TIM_GET_COUNTER(&htim3);
+	right = __HAL_TIM_GET_COUNTER(&htim2);
+	encoder_difference = left - right;
+
+	osDelay(20);
+  }
+  /* USER CODE END encoder_diff */
+}
+
+/* USER CODE BEGIN Header_turning_task */
+/**
+* @brief Function implementing the turningTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_turning_task */
+void turning_task(void *argument)
+{
+  /* USER CODE BEGIN turning_task */
+	int delay = 40;
+
+	float target_rpm_left = 60.0f;
+	float target_rpm_right = 60.0f;
+	float target_angle = 90.0f;
+	float dt = delay/1000.0f;
+
+	int flag = 0;
+
+	//-------------------------- Motor Init -----------------------------
+//	setPID(&pid_left, 1.5f, 0.0f, 0.0f, 0);
+//	setPID(&pid_right, 1.5f, 0.0f, 0.0f, 0);
+//	MotorDrive_enable();
+//	__HAL_TIM_SetCompare(&htim9,TIM_CHANNEL_1,0);  //Motor B (left)
+//	__HAL_TIM_SetCompare(&htim4,TIM_CHANNEL_3,0);  //Motor A (right)
+	//--------------------------------------------------------------------
+
+	//-------------------------- Servo Init -----------------------------
+//	HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_1);
+//	htim12.Instance->CCR1 = SERVO_MIDDLE; //middle
+//	osDelay(5000);
+//	htim12.Instance->CCR1 = SERVO_LEFT; //left
+//	osDelay(1000);
+	//--------------------------------------------------------------------
+
+	//reset value caused by vibration
+//	angle_direction = 0.0f;
+
+  /* Infinite loop */
+  for(;;)
+  {
+	osDelay(1000);
+	continue;
+
+	if (flag) continue;
+
+//    error_angle = target_angle - angle_direction;
+//    error_angle_int = error_angle;
+
+//    PID_Angle(&pid_angle, error_angle, dt);
+//    target_rpm_left = pid_angle.pwm_output;
+//    target_rpm_right = pid_angle.pwm_output;
+//
+//    //----------- Motor Control -------------------------
+//	  error_left_rpm = (target_rpm_left) - motor_left_rpm;
+//	  error_right_rpm = (target_rpm_right) - motor_right_rpm;
+//
+//	  PID_Compute(&pid_left, error_left_rpm, dt);
+//	  PID_Compute(&pid_right, error_right_rpm, dt);
+//
+//	  __HAL_TIM_SetCompare(&htim9,TIM_CHANNEL_2,pid_left.pwm_output);  //Motor B (left)
+//	  __HAL_TIM_SetCompare(&htim4,TIM_CHANNEL_4,pid_right.pwm_output); //Motor A (right)
+    //---------------------------------------------------
+
+
+//	if (error_angle <= 0.2){
+//		MotorStop_both();
+//		osDelay(500);
+//		htim12.Instance->CCR1 = SERVO_MIDDLE; //middle
+//		flag = 1;
+//	}
+
+	osDelay(delay);
+  }
+  /* USER CODE END turning_task */
 }
 
 /**
