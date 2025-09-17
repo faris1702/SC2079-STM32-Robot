@@ -355,6 +355,13 @@ int encoder_difference = 0;
 
 //-------- UART ------------
 uint8_t aRxBuffer[20];
+uint8_t uart_byte;
+uint8_t uart_rx_buffer[64];
+uint8_t uart_index = 0;
+char last_oled_msg[32] = "";
+
+int have_instruction = 0;
+int instruction_type = 0;
 //--------------------------
 
 //------------ PID Controller ----------
@@ -452,8 +459,8 @@ int main(void)
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
   OLED_Init();
+  HAL_UART_Receive_IT(&huart3, &uart_byte, 1);
 
-  HAL_UART_Receive_IT(&huart3, (uint8_t *) aRxBuffer, 10);
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -1252,18 +1259,131 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim){
 }
 
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
-	//Prevent unused argument(s) compilation warning
-	UNUSED(huart);
 
-	HAL_UART_Transmit(&huart3, (uint8_t *)aRxBuffer, 10, 0xFFFF);
+
+void display_if_changed(const char* msg)
+{
+    if (strcmp(last_oled_msg, msg) != 0) {
+//        OLED_Clear();
+        OLED_ShowString(5, 45, msg); //last row
+        strncpy(last_oled_msg, msg, sizeof(last_oled_msg));
+    }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
+	//------------------------ OLD -------------------------------
+	//Prevent unused argument(s) compilation warning
+//	UNUSED(huart);
+//	HAL_UART_Transmit(&huart3, (uint8_t *)aRxBuffer, 10, 0xFFFF);
+	//------------------------------------------------------------
+
+	//------------------------- NEW ------------------------------
+	if (huart->Instance == USART3){
+	  switch (uart_byte){
+		  case 'f':
+			  forward(60.0f, 0.0f, 40);
+			  display_if_changed("Forward");
+			  break;
+
+		  case 'b':
+			  reverse(60.0f, 0.0f, 40);
+			  display_if_changed("Backwards");
+			  break;
+
+		  case 'l':
+			  forwardTurn(RIGHT, 75.0f, 60.0f, 40);
+			  display_if_changed("Turn Left");
+			  break;
+
+		  case 'r':
+			  forwardTurn(RIGHT, 75.0f, 60.0f, 40);
+			  display_if_changed("Turn Right");
+			  break;
+
+		  case 's':
+			  MotorDrive_enable();
+			  MotorStop_both();
+			  display_if_changed("Stopped");
+			  break;
+
+		  default:
+			  if (uart_index < sizeof(uart_rx_buffer) - 1) {
+				  uart_rx_buffer[uart_index++] = uart_byte;
+				  uart_rx_buffer[uart_index] = '\0';
+				  display_if_changed((char*)uart_rx_buffer);
+			  }
+			  break;
+	  }
+
+	  // ✅ Moved here so it always re-enables receive interrupt
+	  HAL_UART_Receive_IT(&huart3, &uart_byte, 1);
+  }
+	//------------------------------------------------------------
 
 }
 
+void I2C_Bus_Recovery(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    // 1. De-init I2C peripheral
+    HAL_I2C_DeInit(&hi2c2);
+
+    // 2. Configure SCL and SDA as GPIO outputs open-drain
+    __HAL_RCC_GPIOB_CLK_ENABLE();  // Change port if your I2C2 pins are different
+
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+
+    GPIO_InitStruct.Pin = GPIO_PIN_10; // SCL (check your board)
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_11; // SDA (check your board)
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    // 3. Toggle SCL about 10 times while SDA is high
+    for (int i = 0; i < 10; i++)
+    {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
+        HAL_Delay(1);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
+        HAL_Delay(1);
+    }
+
+    // 4. Generate a STOP condition manually
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_RESET); // SDA low
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);   // SCL high
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_SET);   // SDA high
+
+    // 5. Re-init I2C peripheral
+    MX_I2C2_Init();
+}
 
 void icm20948_init(void)
 {
     uint8_t data;
+    uint8_t who_am_i;
+
+    I2C_Bus_Recovery();
+
+    // Select bank 0 (just to be safe)
+	data = 0x00;
+	HAL_I2C_Mem_Write(&hi2c2, 0x68 << 1, 0x7F, I2C_MEMADD_SIZE_8BIT, &data, 1, 1000);
+
+	// Read WHO_AM_I (0x00) - should be 0xEA
+	HAL_I2C_Mem_Read(&hi2c2, 0x68 << 1, 0x00, I2C_MEMADD_SIZE_8BIT, &who_am_i, 1, 1000);
+	if (HAL_I2C_Mem_Read(&hi2c2, 0x68<<1, 0x00, I2C_MEMADD_SIZE_8BIT, &who_am_i, 1, 1000) == HAL_OK) {
+	    if (who_am_i == 0xEA) {
+	        OLED_ShowString(70,45,"ok");
+	    } else {
+	        OLED_ShowString(70,45,"bad");
+	    }
+	} else {
+	    OLED_ShowString(70,45,"i2c");
+	}
 
     // Wake up
     data = 0x01;
@@ -1366,30 +1486,30 @@ void PID_Compute(PID_Controller *pid, float error, float dt)
 
 }
 
-void PID_Angle(PID_Controller *pid, float error, float dt){
-	// Integral term with anti-windup
-	pid->integral += error * dt;
-	if (pid->integral > INTEGRAL_MAX_ANGLE) pid->integral = INTEGRAL_MAX_ANGLE;
-	if (pid->integral < -INTEGRAL_MAX_ANGLE) pid->integral = -INTEGRAL_MAX_ANGLE;
-
-	// Derivative term
-	float derivative = (error - pid->prevError) / dt;
-
-	// PID output
-	float output = pid->Kp * error
-				 + pid->Ki * pid->integral
-				 + pid->Kd * derivative;
-
-	// Clamp to output range
-	if (output > OUTPUT_MAX_ANGLE) output = OUTPUT_MAX_ANGLE;
-	if (output < OUTPUT_MIN_ANGLE) output = OUTPUT_MIN_ANGLE;
-
-	pid->pid_change = output;
-	pid->prevError = error;
-	pid->pwm_output = (int)output;
-	if (pid->pwm_output > OUTPUT_MAX_ANGLE) pid->pwm_output = OUTPUT_MAX_ANGLE;
-	if (pid->pwm_output < 0) pid->pwm_output = 0;
-}
+//void PID_Angle(PID_Controller *pid, float error, float dt){
+//	// Integral term with anti-windup
+//	pid->integral += error * dt;
+//	if (pid->integral > INTEGRAL_MAX_ANGLE) pid->integral = INTEGRAL_MAX_ANGLE;
+//	if (pid->integral < -INTEGRAL_MAX_ANGLE) pid->integral = -INTEGRAL_MAX_ANGLE;
+//
+//	// Derivative term
+//	float derivative = (error - pid->prevError) / dt;
+//
+//	// PID output
+//	float output = pid->Kp * error
+//				 + pid->Ki * pid->integral
+//				 + pid->Kd * derivative;
+//
+//	// Clamp to output range
+//	if (output > OUTPUT_MAX_ANGLE) output = OUTPUT_MAX_ANGLE;
+//	if (output < OUTPUT_MIN_ANGLE) output = OUTPUT_MIN_ANGLE;
+//
+//	pid->pid_change = output;
+//	pid->prevError = error;
+//	pid->pwm_output = (int)output;
+//	if (pid->pwm_output > OUTPUT_MAX_ANGLE) pid->pwm_output = OUTPUT_MAX_ANGLE;
+//	if (pid->pwm_output < 0) pid->pwm_output = 0;
+//}
 
 
 
@@ -1487,8 +1607,8 @@ void forwardTurn(int dir, float target_angle, float target_rpm, int delay){
 	//--------------------------------------------------------
 
 	//-------------------- MOTOR START -----------------------
-	setPID(&pid_left, 1.5f, 0.0f, 0.0f, 0);
-	setPID(&pid_right, 1.5f, 0.0f, 0.0f, 0);
+	setPID(&pid_left, 1.0f, 0.0f, 0.0f, 0);
+	setPID(&pid_right, 1.0f, 0.0f, 0.0f, 0);
 	MotorDrive_enable();
 	Motor_direction_both(1);
 	//--------------------------------------------------------
@@ -1520,7 +1640,7 @@ void forwardTurn(int dir, float target_angle, float target_rpm, int delay){
 //			  target_rpm = 30.0f;
 //		  }
 
-		  if ((error_angle) <= 0.2f){
+		  if ((error_angle) <= 0.0f){
 			  MotorStop_both();
 			  osDelay(500);
 			  htim12.Instance->CCR1 = SERVO_MIDDLE;
@@ -1573,7 +1693,7 @@ void reverseTurn(int dir, float target_angle, float target_rpm, int delay){
 //			  target_rpm = 30.0f;
 //		  }
 
-		  if ((error_angle) <= 0.2f){
+		  if ((error_angle) <= 0.0f){
 			  MotorStop_both();
 			  osDelay(500);
 			  htim12.Instance->CCR1 = SERVO_MIDDLE;
@@ -1644,8 +1764,9 @@ void show(void *argument)
 	  OLED_ShowString(5, 35, buffer);
 
 //	  sprintf(buffer, "Angle:%3d", gyro_z_dps_int);
-	  sprintf(buffer, "%04d-\0", encoder_difference);
-	  OLED_ShowString(5, 45, buffer);
+//	  sprintf(buffer, "%04d-\0", pid_right.pwm_output);
+
+//	  OLED_ShowString(5, 45, buffer);
 
 	// ------- Print UART message ----------
 //	sprintf(buffer, "%s\0", aRxBuffer);
@@ -1659,7 +1780,7 @@ void show(void *argument)
 	// This is the only refresh function call in all the tasks
 	OLED_Refresh_Gram();
 
-    osDelay(500);
+    osDelay(250);
   }
   /* USER CODE END show */
 }
@@ -1721,15 +1842,18 @@ void motors(void *argument)
 
 
 	osDelay(5000);  //starting buffer
-	forward(60.0f, 100.0f, 40);
-	osDelay(1000);
-	forward(60.0f, 100.0f, 40);
-	osDelay(1000);
-	reverse(60.0f, 100.0f, 40);
+//	forward(60.0f, 100.0f, 40);
+//	osDelay(1000);
+//	forward(60.0f, 100.0f, 40);
+//	osDelay(1000);
+//	reverse(60.0f, 100.0f, 40);
 //	forwardTurn(RIGHT, 90.0f, 60.0f, 40);
 //	osDelay(2000);
+//	forwardTurn(LEFT, 90.0f, 60.0f, 40);
+//	osDelay(2000);
 //	reverseTurn(LEFT, 90.0f, 60.0f, 40);
-
+//	osDelay(2000);
+//	reverseTurn(RIGHT, 90.0f, 60.0f, 40);
 	//-------------- Servo Init 2 ------------------
 //	htim12.Instance->CCR1 = SERVO_LEFT; //left
 //	osDelay(1000);
@@ -1923,7 +2047,7 @@ void encoder(void *argument)
 void servo(void *argument)
 {
   /* USER CODE BEGIN servo */
-	HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_1);
+//	HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_1);
 
 //	osDelay(1500);
 //    htim12.Instance->CCR1 = SERVO_MIDDLE; //middle
@@ -2101,36 +2225,35 @@ void sensor_reading(void *argument)
 	uint8_t reg_addr = 0x37;    // start from GYRO_ZOUT_H
 	uint8_t rawData[2];         // to store MSB and LSB
 	float B = 0.9f;
-	uint32_t tick1, tick2;
 
 	int16_t drift_raw, drift_total=0;
 	float drift_degrees;
 
 	int delay = 10;
-	float dt = delay/1000.0f;
+	float dt;
 	double offset = 0;
 	double trash = 0;
 	int i = 0;
+	uint32_t tick1, tick2;
 
 	icm20948_init();
 	osDelay(100); //delay to make sure ICM 20948 power up
 
-//	tick1 = HAL_GetTick();
-//
-//	while (i < 1000){
-//		osDelay(1);
-//		HAL_I2C_Master_Transmit(&hi2c2, 0x68 << 1, &reg_addr, 1, 1000);
-//		HAL_I2C_Master_Receive(&hi2c2, 0x68 << 1, rawData, 2, 1000);
-//		drift_raw = (int16_t)((rawData[0] << 8) | rawData[1]);
-//		trash += (double) ((double)drift_raw) * ((HAL_GetTick() - tick1)/16400.0f);
-//		offset += drift_raw;
-//		tick1 = HAL_GetTick();
-//		i++;
-//	}
-//	offset = offset/i;
-//
-//
-//	tick1 = HAL_GetTick();
+	tick1 = HAL_GetTick();
+
+	while (i < 1000){
+		osDelay(1);
+		HAL_I2C_Master_Transmit(&hi2c2, 0x68 << 1, &reg_addr, 1, 1000);
+		HAL_I2C_Master_Receive(&hi2c2, 0x68 << 1, rawData, 2, 1000);
+		drift_raw = (int16_t)((rawData[0] << 8) | rawData[1]);
+		offset += drift_raw;
+		tick1 = HAL_GetTick();
+		i++;
+	}
+	offset = offset/i;
+
+
+	tick1 = HAL_GetTick();
   /* Infinite loop */
   for(;;)
   {
@@ -2150,12 +2273,15 @@ void sensor_reading(void *argument)
 //	angle_direction_int = angle_direction;
 //	tick1 = HAL_GetTick();
 //	if (gyro_z_raw < 150 && gyro_z_raw > 0) gyro_z_raw = 0;
+	gyro_z_raw -= offset;
 	gyro_z_dps = gyro_z_raw / 131.0f;
 	gyro_z_dps_int = gyro_z_dps;
 	// -----------------------------------------------------------------------------
 
 
 	//-------------------- Angle Calculation -----------------------
+	tick2 = HAL_GetTick();
+	dt = (tick2-tick1) / 1000.0f;
 	angle_direction = prev_angle_direction + (gyro_z_dps * dt);
 	prev_angle_direction = angle_direction;
 	angle_direction_int = angle_direction;
@@ -2167,8 +2293,9 @@ void sensor_reading(void *argument)
 //	angle_direction_hpf_int = angle_direction_hpf;
 	//--------------------------------------------------------------
 
+	tick1 = tick2;
 
-	osDelay(delay);
+	osDelay(1);
   }
   /* USER CODE END sensor_reading */
 }
@@ -2253,7 +2380,7 @@ void transmit(void *argument)
 //			  	  	  	  	  	  	  	  	  motor_left_rpm_lpf_int, motor_right_rpm_lpf_int, target_rpm,
 //											  encoder_difference);
 
-	  sprintf(sbuf, "%5d,100\r\n", distance_travelled_int);
+//	  sprintf(sbuf, "%5d,100\r\n", distance_travelled_int);
 
 //	  sprintf(sbuf, "%2d,%2d,%3d,%3d,%2d,%4d,%4d,0\r\n", motor_left_rpm_int, motor_right_rpm_int,
 //			  	  	  	  	  	  	  	  	  (int)error_left_rpm, (int)error_right_rpm, target_rpm,
@@ -2264,13 +2391,13 @@ void transmit(void *argument)
 //	  sprintf(sbuf, "%2d,%3d\r\n", error_angle, angle_direction_hpf_int);
 	  //---------------------------------------------------------------------------------------------
 
-	  //----------------------------- IR Distance --------------------------------------
-//	  sprintf(sbuf, "%5d,%5d,%3d\r\n", ir_dist_left_int, ir_dist_right_int, us_dist_int);
-	  //--------------------------------------------------------------------------------
-
 	  //------------------------------ Gyroscope readings -------------------------------------
 //	  sprintf(sbuf, "%5d,%3d,%3d,%3d,90\r\n", gyro_z_raw, gyro_z_dps_int, angle_direction_int, error_angle_int);
 	  //---------------------------------------------------------------------------------------
+
+	  //----------------------- IR Distance / UART w RPi -------------------------------
+	  sprintf(sbuf, "%5d,%5d,%3d\r\n", ir_dist_left_int, ir_dist_right_int, us_dist_int);
+	  //--------------------------------------------------------------------------------
 
 	  HAL_UART_Transmit(&huart3, sbuf, strlen(sbuf), 0xFFFF);
 
@@ -2278,7 +2405,7 @@ void transmit(void *argument)
 //	if (ch < 'Z') ch++;
 //	else ch = 'A';
 
-    osDelay(40);
+    osDelay(200);
   }
   /* USER CODE END transmit */
 }
