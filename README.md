@@ -1,1 +1,1 @@
-Sometimes you very good, sometimes very bad.
+Sometimes very good, sometimes very bad.
